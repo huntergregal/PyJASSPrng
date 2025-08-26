@@ -1,3 +1,6 @@
+import ctypes as C
+import struct
+
 class JASSPrng:
     '''
     Warcraft 3 JASS Pseudorandom number generator
@@ -117,21 +120,263 @@ class JASSPrng:
     
         return min_val + t
 
+    def GetRandomReal(self, min_val: float, max_val: float) -> float:
+        #Exact bitwise match of JASS GetRandomReal.
+
+        #The f32 helper functions are needed (as opposed to say, using numpy)
+        #because the JASS natives differ from IEEE754 in these ways:
+        #    * subnormals treated as 0 on input and output
+        #    * no rounding -- truncates after alginment
+        #    *no NaN/Inf handling
+
+        #s/o GPT 5 for explaining these operations. Was not quite sure what they
+        #were doing with the floats. Now it tracks. These are architecture
+        #agnostic variants of float 32 sub/add/mult w/ some... quirks.
+
+
+        def u32(x): return C.c_uint32(x).value
+        def s32(x): return C.c_int32(x).value
+        def float_to_u32(f): return struct.unpack('<I', struct.pack('<f', f))[0]
+        def u32_to_float(u): return struct.unpack('<f', struct.pack('<I', u & 0xffffffff))[0]
+
+        def _clz32_c(x: int) -> int:
+            x = u32(x)
+            if x == 0: return 32
+            i = 31
+            while (x >> i) == 0:
+                i -= 1
+            return 31 - i  # number of leading zeros in 32-bit lane
+        
+        def _signed_sig_x2(u: int) -> int:
+            # ((mant|0x800000)*2 ^ (int)u>>31) - ((int)u>>31)  in 32-bit lanes
+            u  = u32(u)
+            m2 = u32((u & 0x7fffff) | 0x800000)
+            m2 = u32(m2 * 2)
+            s  = s32(u) >> 31                  # 0 or -1
+            v  = u32(m2 ^ u32(s))             # xor in u32
+            return s32(s32(v) - s)            # signed subtract
+        
+        def f32_add(a_bits: int, b_bits: int) -> int:
+            a = u32(a_bits); b = u32(b_bits)
+        
+            exp_a = a & 0x7f800000
+            if exp_a == 0:
+                return b
+            exp_b = b & 0x7f800000
+            if exp_b == 0:
+                return a
+        
+            sig_a = _signed_sig_x2(a)
+            sig_b = _signed_sig_x2(b)
+        
+            diff = u32(exp_b - exp_a)
+            if s32(diff) < 1:
+                if s32(diff) < -0x0B7FFFFF:
+                    return a
+                sh = ((u32(exp_a - exp_b) >> 23) & 0x1f)
+                sig_b = s32(sig_b >> sh)       # arithmetic shift
+                exp_big = exp_a
+            else:
+                if s32(diff) > 0x0B7FFFFF:
+                    return b
+                sh = ((diff >> 23) & 0x1f)
+                sig_a = s32(sig_a >> sh)
+                exp_big = exp_b
+        
+            sum_signed = s32(s32(sig_a) + s32(sig_b))
+            if sum_signed == 0:
+                return 0x00000000
+        
+            sign_bit = 0x80000000 if sum_signed < 0 else 0
+            mag = u32(-sum_signed if sum_signed < 0 else sum_signed)
+        
+            clz = _clz32_c(mag)
+            # Branchy renorm, exactly like the decompile: shift so leading 1 ends at bit 23,
+            # exponent delta is (7 - clz) << 23
+            shift_amt = -clz + 8
+            if shift_amt < 0:
+                mag = u32((mag << u32(-shift_amt)) & 0xffffffff)
+            else:
+                # use arithmetic-looking shift on a positive value to mirror C’s >> on unsigned promoted to int
+                mag = u32(s32(mag) >> (shift_amt & 0x1f))
+        
+            out = u32((((-clz + 7) * 0x800000) + exp_big) |
+                       (mag & 0x7fffff) |
+                       sign_bit)
+            return out
+        
+        def f32_sub(op1_bits: int, op2_bits: int) -> int:
+            return f32_add(op1_bits, u32(op2_bits) ^ 0x80000000)
+
+        def f32_mult(a_bits: int, b_bits: int) -> int:
+            a = a_bits & 0xffffffff
+            b = b_bits & 0xffffffff
+        
+            sign = (a ^ b) & 0x80000000
+            Ea = a & 0x7f800000
+            Eb = b & 0x7f800000
+            Ma = a & 0x007fffff
+            Mb = b & 0x007fffff
+        
+            # WC3 semantics: treat subnormals/zeros as 0 (result 0)
+            if Ea == 0 or Eb == 0:
+                print("=== f32_mult debug (zero/subnormal) ===")
+                return 0x00000000
+        
+            # 24-bit significands with hidden 1
+            Ma1 = (1 << 23) | Ma
+            Mb1 = (1 << 23) | Mb
+        
+            # 24x24 -> 48-bit product
+            P = (Ma1 * Mb1) & 0xffffffffffffffff  # keep 64b for clarity
+        
+            # topbit is the 48-bit product's bit 47 (>= 2.0 requires a renorm step)
+            topbit = (P >> 47) & 1
+        
+            # Truncation (no rounding): shift 23 or 24 depending on topbit
+            mant = (P >> (23 + topbit)) & 0x007fffff
+        
+            # Exponent combine: Ea + Eb - bias
+            # (0xC0800000 is -0x3F800000 modulo 2^32)
+            E = (Ea + Eb + 0xC0800000) & 0xffffffff
+        
+            # If topbit==1, renormalize by bumping exponent by 1 ulp of exponent field
+            if topbit:
+                E = (E + 0x00800000) & 0xffffffff
+        
+            # Underflow to zero if exponent would be subnormal (WC3 collapses subnormals)
+            if ((E - 0x00800000) & 0xffffffff) >> 31:  # unsigned test E < 0x00800000
+                out = 0x00000000
+            else:
+                out = (sign | (E & 0x7f800000) | mant) & 0xffffffff
+        
+            return out
+
+        def s32_to_f32(param_2: int) -> int:
+            param_2 &= 0xffffffff
+            if param_2 == 0:
+                return 0x00000000
+            sign = param_2 & 0x80000000
+            if s32(param_2) < 0:
+                param_2 = (-param_2) & 0xffffffff
+            iVar1 = _clz32_c(param_2)
+            shift_amt = iVar1 - 8
+            if shift_amt < 0:
+                uVar4 = s32(param_2) >> ((-shift_amt) & 0x1f)
+            else:
+                uVar4 = (param_2 << (shift_amt & 0x1f)) & 0xffffffff
+            return (((0x9e - iVar1) * 0x800000) | (uVar4 & 0x7fffff) | sign) & 0xffffffff
+
+        # Sanity Check for R2SW debug
+        def f32_from_bits(u: int) -> float:
+                return struct.unpack('<f', struct.pack('<I', u & 0xffffffff))[0]
+        def f32_to_bits(x: float) -> int:
+            return struct.unpack('<I', struct.pack('<f', x))[0] & 0xffffffff
+
+        def r2sw_trunc_f32_bits(val_bits: int, width: int, precision: int) -> str:
+            """Emulate JASS R2SW: truncate to 'precision' decimals (no rounding), pad zeros."""
+            x = f32_from_bits(val_bits)
+            neg = x < 0.0
+            ax = -x if neg else x
+        
+            # integer part (truncate toward zero)
+            i_part = int(ax)
+            frac_bits = f32_sub(f32_to_bits(ax), f32_to_bits(float(i_part)))  # ax - i_part (f32)
+            s = "-" + str(i_part) if neg and (i_part != 0 or f32_from_bits(frac_bits) != 0.0) else str(i_part)
+        
+            # fractional digits by repeated *10 (all in f32) with truncation each step
+            if precision > 0:
+                s += "."
+                ten_bits = 0x41200000  # 10.0f
+                for _ in range(precision):
+                    frac_bits = f32_mult(frac_bits, ten_bits)           # frac *= 10
+                    digit = int(f32_from_bits(frac_bits))               # trunc toward 0
+                    s += str(digit)
+                    # frac -= digit
+                    digit_bits = f32_to_bits(float(digit))
+                    frac_bits = f32_sub(frac_bits, digit_bits)
+        
+            # left-pad to width if needed
+            if width > 0 and len(s) < width:
+                s = " " * (width - len(s)) + s
+            return s
+
+        # ------------------------
+        # 1) clamp = min - max
+        # ------------------------
+        u_min_val = float_to_u32(min_val)
+        u_max_val = float_to_u32(max_val)
+        width_bits = f32_sub(u_min_val, u_max_val)
+
+        threshold = u32_to_float(0x3456bf95)
+        if abs(u32_to_float(width_bits)) < threshold:
+            return u32_to_float(u_min_val)
+   
+        # ------------------------
+        # 2) width = |max - min|, stored via the same sub_float32 calls
+        #    (note: final add always uses ORIGINAL min pointer)
+        # ------------------------
+        if min_val <= max_val:
+            width_bits = f32_sub(u_max_val, u_min_val)  # max - min (positive)
+        else:
+            width_bits = f32_sub(u_min_val, u_max_val)  # min - max (positive)
+    
+        # ------------------------
+        # 3) u in [0,1): use LOW 23 bits of rnd
+        # ------------------------
+        rnd = self.Step() & 0xffffffff
+        one_to_two_bits = ((rnd & 0x7fffff) | 0x3f800000) & 0xffffffff
+        g_rand_add_bits = s32_to_f32(0xffffffff)             # -1.0f => 0xbf800000
+        u_bits = f32_add(one_to_two_bits, g_rand_add_bits)   # (1.xxx) + (-1.0) => [0,1)
+
+
+        # ------------------------
+        # 4) result = min + width * u   (all via custom ops)
+        # ------------------------
+        scaled_bits = f32_mult(width_bits, u_bits)
+        out_bits = f32_add(u_min_val, scaled_bits)  # add to ORIGINAL min pointer
+
+        return u32_to_float(out_bits)
+
+
 if __name__ == '__main__':
     print('=== Wc3 JASS Test ===')
-    print('function test takes nothing returns nothing')
-    print('    call SetRandomSeed(12345)')
-    print('    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r1=" + I2S(GetRandomInt(0, 1000000)))')
-    print('    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r2=" + I2S(GetRandomInt(0, 1000000)))')
-    print('    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r3=" + I2S(GetRandomInt(0, 1000000)))')
-    print('endfunction')
+    print('''function test takes nothing returns nothing
+    call SetRandomSeed(12345)
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r1=" + I2S(GetRandomInt(0, 1000000)))
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r2=" + I2S(GetRandomInt(0, 1000000)))
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r3=" + I2S(GetRandomInt(0, 1000000)))
+
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r4=" + R2S(GetRandomReal(2.245, 6.532)))
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r4W=" + R2SW(GetRandomReal(2.245, 6.532), 8, 9))
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r5=" + R2S(GetRandomReal(1.1, 2.5)))
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r5W=" + R2SW(GetRandomReal(1.1, 2.5), 8, 9))
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r6=" + R2S(GetRandomReal(-2.1, 3.14)))
+    call DisplayTimedTextToPlayer(Player(0), 0, 0, 60, "r6W=" + R2SW(GetRandomReal(-2.1, 3.14), 8, 9))
+endfunction''')
     print('==Wc3 Output==')
     print('r1=189832')
     print('r2=638801')
     print('r3=925099')
+    print('r4=2.566')
+
+    print('r4W=4.405078400')
+    print('r5=1.568')
+    print('r5W=1.275389408')
+    print('r6=-0.997')
+    print('r6W=0.035798548')
 
     print('=== JASSPrng Python Test ===')
     rng = JASSPrng()
     rng.SetRandomSeed(12345)
+    print('=ints=')
     for i in range (1, 4):
         print(f'r{i}={rng.GetRandomInt(0, 1000000)}')
+
+    print('=floats=')
+    reals = [(2.245, 6.532), (1.1, 2.5), (-2.1, 3.14)]
+    for i in range(len(reals)):
+        x = rng.GetRandomReal(reals[i][0], reals[i][1])
+        print(f'r{i+4}={x:4.3f}')
+        x = rng.GetRandomReal(reals[i][0], reals[i][1])
+        print(f'r{i+4}W={x:4.10f}') # precision ever so slightly off due to python
